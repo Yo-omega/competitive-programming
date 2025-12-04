@@ -27,12 +27,21 @@ struct Building
 	int type; // 0 = Landing Pad, >0 = Module
 	int num_astronauts;
 	Point p;
-	map<int, int> astronaut_counts; // Target Type -> Count of Astronauts
+	map<int, int> astronaut_counts; // Target Type -> Count
+
+	// Helper to get total waiting (sum of all types)
+	int total_waiting() const
+	{
+		int sum = 0;
+		for (auto const &[t, c] : astronaut_counts)
+			sum += c;
+		return sum;
+	}
 };
 
 struct Route
 {
-	int u, v; // Always u < v
+	int u, v; // u < v
 	int capacity;
 	bool is_teleporter;
 };
@@ -55,16 +64,26 @@ double dist(Point p1, Point p2)
 	return sqrt(dist_sq(p1, p2));
 }
 
-// 2D Cross Product for intersection tests
 double cross_product(Point a, Point b, Point c)
 {
 	return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
 }
 
-// Check if segment AB intersects CD
+// Distance from point P to segment AB
+double point_to_segment_dist(Point p, Point a, Point b)
+{
+	double l2 = dist_sq(a, b);
+	if (l2 == 0)
+		return dist(p, a);
+	double t = ((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / l2;
+	t = max(0.0, min(1.0, t));
+	Point projection = {a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)};
+	return dist(p, projection);
+}
+
+// Check if Segment AB overlaps Segment CD
 bool segments_intersect(Point a, Point b, Point c, Point d)
 {
-	// If they share an endpoint, no intersection for game logic
 	if (dist_sq(a, c) < 1e-5 || dist_sq(a, d) < 1e-5 ||
 		dist_sq(b, c) < 1e-5 || dist_sq(b, d) < 1e-5)
 		return false;
@@ -74,7 +93,6 @@ bool segments_intersect(Point a, Point b, Point c, Point d)
 	auto cp3 = cross_product(c, d, a);
 	auto cp4 = cross_product(c, d, b);
 
-	// Strict crossing check
 	if (((cp1 > 1e-7 && cp2 < -1e-7) || (cp1 < -1e-7 && cp2 > 1e-7)) &&
 		((cp3 > 1e-7 && cp4 < -1e-7) || (cp3 < -1e-7 && cp4 > 1e-7)))
 		return true;
@@ -89,26 +107,27 @@ bool segments_intersect(Point a, Point b, Point c, Point d)
 class Solver
 {
 public:
+	// Game State
 	map<int, Building> buildings;
 	vector<Route> routes;
 	vector<Pod> pods;
 	int resources;
 	int next_pod_id = 1;
+	int turn_count = 0; // Turn Awareness
 
-	// --- Turn Context ---
-	map<pair<int, int>, Route *> route_map; // Look up route by (u, v)
-	map<int, vector<int>> adj;				// Adjacency List
+	// Per-Turn Logic
+	map<pair<int, int>, Route *> route_map;
+	map<int, vector<int>> adj;
 	vector<string> action_queue;
 
-	// Union-Find / Component Tracking for Network Connectivity
+	// Analytics
 	map<int, int> component_id;
-	map<int, set<int>> component_types; // Component ID -> Set of module types present
-	int num_components;
+	map<int, set<int>> component_types;
 
-	// ----------------------------------------
-	// SETUP & RESET
-	// ----------------------------------------
+	// Congestion Tracking: Store total waiting at Source ID for previous turn
+	map<int, int> prev_total_waiting_at_source;
 
+	// Reset for fresh turn
 	void reset_turn()
 	{
 		routes.clear();
@@ -116,12 +135,12 @@ public:
 		route_map.clear();
 		adj.clear();
 		action_queue.clear();
-
 		component_id.clear();
 		component_types.clear();
+
+		turn_count++;
 	}
 
-	// Normalize edge key: u < v
 	pair<int, int> edge_key(int u, int v)
 	{
 		if (u > v)
@@ -129,9 +148,8 @@ public:
 		return {u, v};
 	}
 
-	int get_cost(int u, int v)
+	int get_tube_cost(int u, int v)
 	{
-		// Tube cost logic: floor(distance * 10)
 		double d = dist(buildings[u].p, buildings[v].p);
 		return max(1, (int)floor(d * 10.0));
 	}
@@ -141,47 +159,57 @@ public:
 		return route_map.count(edge_key(u, v));
 	}
 
-	// Geometry Check
-	bool can_build_tube(int u, int v)
+	// STRICT GEOMETRY CHECK: Collision with Routes AND Buildings
+	bool is_valid_tube_geom(int u, int v)
 	{
 		if (has_route(u, v))
 			return false;
+
 		Point A = buildings[u].p;
 		Point B = buildings[v].p;
 
+		// 1. Check Intersection with existing tubes
 		for (const auto &r : routes)
 		{
 			if (r.is_teleporter)
-				continue; // Teleporters are instant, no physical tube
+				continue;
 			Point C = buildings[r.u].p;
 			Point D = buildings[r.v].p;
 			if (segments_intersect(A, B, C, D))
 				return false;
 		}
+
+		// 2. STRICT CHECK: Does it pass through another Building?
+		// Using threshold 1.5 units (safe for standard buildings)
+		double safety_radius = 1.5;
+		for (auto const &[id, b] : buildings)
+		{
+			if (id == u || id == v)
+				continue;
+			if (point_to_segment_dist(b.p, A, B) < safety_radius)
+			{
+				return false; // Collides with a building
+			}
+		}
+
 		return true;
 	}
 
-	// ----------------------------------------
-	// CONNECTED COMPONENTS ANALYSIS
-	// ----------------------------------------
-
 	void build_components()
 	{
-		// Simple BFS to find components
 		set<int> visited;
-		num_components = 0;
-
+		int num_components = 0;
 		for (auto const &[id, b] : buildings)
 		{
 			if (visited.count(id))
 				continue;
-
 			num_components++;
 			queue<int> q;
 			q.push(id);
 			visited.insert(id);
 			component_id[id] = num_components;
 
+			// Register self
 			if (b.type != 0)
 				component_types[num_components].insert(b.type);
 
@@ -189,109 +217,127 @@ public:
 			{
 				int curr = q.front();
 				q.pop();
-
-				// Check types in current building
+				// Register type
 				if (buildings[curr].type != 0)
 					component_types[num_components].insert(buildings[curr].type);
 
-				for (int neighbor : adj[curr])
+				for (int n : adj[curr])
 				{
-					if (!visited.count(neighbor))
+					if (!visited.count(n))
 					{
-						visited.insert(neighbor);
-						component_id[neighbor] = num_components;
-						q.push(neighbor);
+						visited.insert(n);
+						component_id[n] = num_components;
+						q.push(n);
 					}
 				}
 			}
 		}
 	}
 
-	// Returns true if building ID 'b_start' is strictly connected (via tubes) to a module of 'target_type'
-	bool is_connected_to_type(int b_start, int target_type)
+	// Finds best path type: 1 = u-v-w-u (triangle), 2 = u-v-w-z-u (quad)
+	string create_smart_pod(int u, int v)
 	{
-		int c_id = component_id[b_start];
-		return component_types[c_id].count(target_type) > 0;
+		// Linear default
+		string linear = to_string(u) + " " + to_string(v) + " " + to_string(u);
+
+		// Try Triangle
+		for (int w : adj[v])
+		{
+			if (w == u)
+				continue;
+			bool connected_to_start = false;
+			for (int k : adj[w])
+				if (k == u)
+					connected_to_start = true;
+
+			if (connected_to_start)
+			{
+				// Triangle Found: U->V->W->U
+				return to_string(u) + " " + to_string(v) + " " + to_string(w) + " " + to_string(u);
+			}
+		}
+		return linear;
 	}
 
-	// ----------------------------------------
-	// MAIN LOGIC
-	// ----------------------------------------
+	// ========================
+	// LOGIC EXECUTION
+	// ========================
 
 	void solve()
 	{
-		// 1. Rebuild Adjacency
+		// Init Graph
 		for (const auto &r : routes)
 		{
 			adj[r.u].push_back(r.v);
 			adj[r.v].push_back(r.u);
 		}
-
-		// 2. Build Component Map
 		build_components();
 
-		// 3. Traffic Counts
-		// Simple heuristic: count waiting passengers for each edge they *could* take next.
-		// Actually, just knowing total Waiting vs. Capacity on existing edges is enough for UPGRADES.
+		// Proposals Vector: <Score (lower=better), From, To, IsTeleport>
+		vector<tuple<double, int, int, bool>> proposals;
+		bool saving_mode = false;
 
-		// --------------------------------------------
-		// STRATEGY PHASE 1: CONNECT THE DISCONNECTED
-		// --------------------------------------------
-
-		// Priority Queue for Construction: <Cost, AstronautsWaiting, StartNode, EndNode>
-		// Use double for priority to weigh Urgency vs Cost.
-		vector<tuple<double, int, int>> build_proposals;
-
-		for (auto &pair : buildings)
+		// 1. IDENTIFY NEEDS
+		for (auto &[b_id, b] : buildings)
 		{
-			Building &b = pair.second;
-			// Only care about Landing Pads with people
+			// Turn Aware: Don't start new expensive paths late game if empty
+			if (turn_count > 18)
+				continue;
+
 			if (b.type != 0 || b.num_astronauts == 0)
 				continue;
 
-			for (auto const &[target_type, count] : b.astronaut_counts)
+			for (auto const &[type, count] : b.astronaut_counts)
 			{
-				if (count == 0)
+				// Check connectivity via Components
+				if (component_id[b.id] != 0 && component_types[component_id[b.id]].count(type))
 					continue;
 
-				// If already connected to target type, skip construction (Network handles it)
-				if (is_connected_to_type(b.id, target_type))
-					continue;
-
-				// FIND BEST CONNECTION
-				// Strategy: Connect to ANY building that is PART OF A COMPONENT containing target_type.
-				// Or if none exist, connect to the target_type building itself (starting a new component).
-
-				double best_dist = 1e9;
+				double best_score = 1e18;
 				int best_target = -1;
+				bool needs_teleporter = false;
 
-				// Candidate search
-				for (auto &candidate : buildings)
+				for (auto &[cand_id, cand] : buildings)
 				{
-					if (candidate.first == b.id)
+					if (cand_id == b_id)
 						continue;
 
-					// Is this candidate useful?
-					// Either it IS the type we want, OR it's connected to the type we want.
-					bool useful = (candidate.second.type == target_type);
-					if (!useful)
-					{
-						int c_id = component_id[candidate.first];
-						if (c_id != 0 && component_types[c_id].count(target_type))
-							useful = true;
-					}
+					// Candidate useful if it matches type OR connects to component with type
+					bool useful = (cand.type == type);
+					if (!useful && component_id[cand_id] != 0 && component_types[component_id[cand_id]].count(type))
+						useful = true;
 
 					if (useful)
 					{
-						// Check Euclidean dist
-						double d = dist(b.p, candidate.second.p);
-						if (d < best_dist)
+						double d = dist(b.p, cand.p);
+
+						// "BALANCE SCORING": Prioritize sources with FEWER astronauts.
+						// Standard efficient: Score = Cost / Count (High count -> Low score -> Best).
+						// Balance efficient: Score = Cost * Count. (Low count -> Low score -> Best).
+						double score = d * (double)count;
+
+						// Check Geometric viability
+						if (is_valid_tube_geom(b.id, cand_id))
 						{
-							// verify geometry now to save time
-							if (can_build_tube(b.id, candidate.first))
+							if (score < best_score)
 							{
-								best_dist = d;
-								best_target = candidate.first;
+								best_score = score;
+								best_target = cand_id;
+								needs_teleporter = false;
+							}
+						}
+						// Teleporter Check: If standard is blocked or dist is huge
+						else if (count > 20)
+						{													 // Teleport valuable loads only
+							double tele_heuristic = (5000.0 / 10.0) * count; // Base cost roughly 500 equivalent dist
+							if (d > 25.0)
+								tele_heuristic /= 2.0; // Distance discount
+
+							if (tele_heuristic < best_score)
+							{
+								best_score = tele_heuristic;
+								best_target = cand_id;
+								needs_teleporter = true;
 							}
 						}
 					}
@@ -299,167 +345,133 @@ public:
 
 				if (best_target != -1)
 				{
-					// Heuristic: Cost / (Count + 1). Lower is better.
-					// We prioritize Cheap connections with High Passengers.
-					double heuristic = best_dist / (double)(count + 1);
-					build_proposals.emplace_back(heuristic, b.id, best_target);
+					proposals.emplace_back(best_score, b.id, best_target, needs_teleporter);
 				}
 			}
 		}
 
-		// Sort: Best heuristic first (Smallest value)
-		sort(build_proposals.begin(), build_proposals.end());
+		// Sort Best Proposals
+		sort(proposals.begin(), proposals.end());
 
-		// EXECUTE CONSTRUCTION
-		for (const auto &prop : build_proposals)
+		// 2. BUILD PHASE
+		for (auto &prop : proposals)
 		{
 			int u = get<1>(prop);
 			int v = get<2>(prop);
+			bool is_tele = get<3>(prop);
 
 			if (has_route(u, v))
 				continue;
 
-			int cost = get_cost(u, v);
-
-			// Check budget: Must be able to afford Tube AND a Pod (1000)
-			if (resources >= cost + 1000)
+			if (is_tele)
 			{
-				if (can_build_tube(u, v))
+				// SAVING LOGIC
+				if (resources < 5000)
 				{
-					resources -= cost;
-					// Command
-					action_queue.push_back("TUBE " + to_string(u) + " " + to_string(v));
-
-					// Logic update (instant graph update for subsequent loop iterations in same turn?)
-					// Ideally yes, but for now we rely on greedy distinct choices.
-					// Let's create the object locally so future `can_build_tube` checks see it
-					Route r = {min(u, v), max(u, v), 1, false};
-					routes.push_back(r);
-					route_map[edge_key(u, v)] = &routes.back(); // temporary
-
-					// Build Pod immediately? Usually yes, to enable the route.
-					// For the POD command, we can try to make a loop if applicable.
-
-					// LOOP DETECTION for Pods
-					// Do U and V share a common neighbor W?
-					// Because 'routes' was updated, adjacency needs a local check or just check `route_map`
-					int w = -1;
-					for (auto const &nb : buildings)
+					if (resources > 3500)
 					{
-						int nid = nb.first;
-						if (nid == u || nid == v)
-							continue;
-						if (has_route(u, nid) && has_route(v, nid))
-						{
-							w = nid;
-							break;
-						}
-					}
-
-					int pid = next_pod_id++; // Use virtual ID
-					resources -= 1000;
-
-					if (w != -1)
-					{
-						// Triangle route
-						action_queue.push_back("POD " + to_string(pid) + " " + to_string(u) + " " + to_string(v) + " " + to_string(w) + " " + to_string(u));
-					}
-					else
-					{
-						// Linear route
-						action_queue.push_back("POD " + to_string(pid) + " " + to_string(u) + " " + to_string(v) + " " + to_string(u));
-					}
-				}
-			}
-		}
-
-		// --------------------------------------------
-		// STRATEGY PHASE 2: POD MANAGEMENT
-		// --------------------------------------------
-
-		// If we have extra money, check for bottlenecks (Lines with NO pods).
-		// Since we add pods with new tubes, this is for legacy lines or complex transfers.
-		// Or if capacity is 1 but we need more pods.
-		// SIMPLIFIED: For now, the creation phase handles most.
-		// We scan for heavy edges without pods.
-
-		if (resources > 1500)
-		{
-			for (const auto &r : routes)
-			{
-				if (r.is_teleporter)
-					continue;
-				// Basic check: is there a pod covering this edge?
-				bool covered = false;
-				for (const auto &p : pods)
-				{
-					for (size_t k = 0; k < p.path.size() - 1; ++k)
-					{
-						int p_u = p.path[k], p_v = p.path[k + 1];
-						if (edge_key(p_u, p_v) == edge_key(r.u, r.v))
-						{
-							covered = true;
-							break;
-						}
-					}
-					if (covered)
+						// We are close! Stop building tubes to afford this next turn.
+						saving_mode = true;
 						break;
+					}
+					continue; // Cant afford yet, check next proposal
 				}
 
-				if (!covered)
+				action_queue.push_back("TELEPORT " + to_string(u) + " " + to_string(v));
+				resources -= 5000;
+
+				// Logic update
+				adj[u].push_back(v);
+				adj[v].push_back(u);
+				route_map[edge_key(u, v)] = nullptr;
+			}
+			else
+			{
+				if (saving_mode)
+					break; // Don't spend small change
+
+				int cost = get_tube_cost(u, v);
+				if (resources >= cost + 1000)
 				{
-					resources -= 1000;
-					int pid = next_pod_id++; // Virtual
-					// Attempt Triangle
-					int w = -1;
-					for (auto const &item : route_map)
+					// Double check geometry safety just in case greedy order changed things (unlikely with this solver logic, but safe)
+					if (is_valid_tube_geom(u, v))
 					{
-						int o1 = item.first.first;
-						int o2 = item.first.second;
-						// finding neighbor common to r.u and r.v
-						// lazy iteration
+						action_queue.push_back("TUBE " + to_string(u) + " " + to_string(v));
+						resources -= cost;
+
+						// Update locally to detect triangles immediately
+						adj[u].push_back(v);
+						adj[v].push_back(u);
+						route_map[edge_key(u, v)] = nullptr;
+
+						// Create Pod
+						int pid = next_pod_id++;
+						resources -= 1000;
+						action_queue.push_back("POD " + to_string(pid) + " " + create_smart_pod(u, v));
 					}
-					// Faster way using Adjacency list (rebuilt or local)
-					// ... defaulting to simple liner to be safe/fast
-					action_queue.push_back("POD " + to_string(pid) + " " + to_string(r.u) + " " + to_string(r.v) + " " + to_string(r.u));
 				}
-				if (resources < 1500)
-					break;
 			}
 		}
 
-		// --------------------------------------------
-		// STRATEGY PHASE 3: STRATEGIC UPGRADES
-		// --------------------------------------------
-		// Upgrades increase tube capacity.
-		// Heuristic: If queue length > capacity * 5.
-		// We don't have perfect queue info here without running simulation.
-		// As a proxy: Total astronauts at B1 targeting Type T, and next hop is B2...
-		// For now, simpler: Upgrade everything if we are filthy rich.
-		// Or conservatively: upgrade nothing. The initial tests pass with default cap.
-
-		if (resources > 5000)
+		// 3. DYNAMIC UPGRADES
+		if (!saving_mode)
 		{
-			// Luxury: Teleporters?
-			// Only use Teleporters if map is huge and resource > 20000 or disconnected clusters impossible to reach.
-			// Given previous failures, let's skip Teleporters unless explicitly obvious.
+			for (auto const &[edge, r] : route_map)
+			{
+				if (!r || r->is_teleporter)
+					continue;
+
+				int u = edge.first;
+				int v = edge.second;
+
+				// Check source congestion of both ends
+				bool needs_upgrade = false;
+
+				// Look at buildings U and V
+				// If the TOTAL number of waiting people strictly increased, upgrade.
+				// We use sum(wait) of neighbors because explicit path calculation is heavy.
+				int curr_u = buildings[u].total_waiting();
+				int curr_v = buildings[v].total_waiting();
+
+				// Retrieve prev stats
+				int prev_u = prev_total_waiting_at_source.count(u) ? prev_total_waiting_at_source[u] : 0;
+				int prev_v = prev_total_waiting_at_source.count(v) ? prev_total_waiting_at_source[v] : 0;
+
+				// Logic: If queue growing, and significant absolute size
+				if (curr_u > prev_u && curr_u > 5 * r->capacity)
+					needs_upgrade = true;
+				if (curr_v > prev_v && curr_v > 5 * r->capacity)
+					needs_upgrade = true;
+
+				if (needs_upgrade)
+				{
+					int cost = get_tube_cost(u, v);
+					if (resources >= cost)
+					{
+						action_queue.push_back("UPGRADE " + to_string(u) + " " + to_string(v));
+						resources -= cost;
+						r->capacity++;
+					}
+				}
+			}
 		}
 
-		// --------------------------------------------
-		// OUTPUT
-		// --------------------------------------------
+		// Update Prev Stats for next turn
+		prev_total_waiting_at_source.clear();
+		for (auto const &[id, b] : buildings)
+		{
+			if (b.type == 0)
+				prev_total_waiting_at_source[id] = b.total_waiting();
+		}
 
+		// Output
 		if (action_queue.empty())
-		{
 			cout << "WAIT" << endl;
-		}
 		else
 		{
 			for (size_t i = 0; i < action_queue.size(); ++i)
 			{
-				cout << action_queue[i];
-				if (i < action_queue.size() - 1)
-					cout << ";";
+				cout << action_queue[i] << (i < action_queue.size() - 1 ? ";" : "");
 			}
 			cout << endl;
 		}
@@ -475,70 +487,57 @@ int main()
 			break;
 		cin.ignore();
 
-		int num_travel_routes;
-		cin >> num_travel_routes;
+		int num_routes;
+		cin >> num_routes;
 		cin.ignore();
-
 		solver.reset_turn();
 
-		for (int i = 0; i < num_travel_routes; i++)
+		for (int i = 0; i < num_routes; ++i)
 		{
-			int u, v, capacity;
-			cin >> u >> v >> capacity;
+			int u, v, c;
+			cin >> u >> v >> c;
 			cin.ignore();
-
-			Route r;
-			r.u = min(u, v);
-			r.v = max(u, v);
-			r.capacity = capacity;
-			r.is_teleporter = (capacity == 0);
-
-			solver.routes.push_back(r);
+			solver.routes.push_back({min(u, v), max(u, v), c, c == 0});
 			solver.route_map[solver.edge_key(u, v)] = &solver.routes.back();
 		}
 
 		int num_pods;
 		cin >> num_pods;
 		cin.ignore();
-		int max_id = 0;
-		for (int i = 0; i < num_pods; i++)
+		int max_pid = 0;
+		for (int i = 0; i < num_pods; ++i)
 		{
-			string line;
-			getline(cin, line);
-			stringstream ss(line);
+			string l;
+			getline(cin, l);
+			stringstream ss(l);
 			Pod p;
-			int num_stops, stop;
-			ss >> p.id >> num_stops;
-			max_id = max(max_id, p.id);
+			int cnt, stop;
+			ss >> p.id >> cnt;
+			max_pid = max(max_pid, p.id);
 			while (ss >> stop)
 				p.path.push_back(stop);
 			solver.pods.push_back(p);
 		}
-		solver.next_pod_id = max_id + 1; // Ensure new IDs don't conflict
+		solver.next_pod_id = max_pid + 1;
 
-		int num_new_buildings;
-		cin >> num_new_buildings;
+		int num_builds;
+		cin >> num_builds;
 		cin.ignore();
-		for (int i = 0; i < num_new_buildings; i++)
+		for (int i = 0; i < num_builds; ++i)
 		{
-			string line;
-			getline(cin, line);
-			stringstream ss(line);
-
+			string l;
+			getline(cin, l);
+			stringstream ss(l);
 			Building b;
-			int type_or_zero;
-			ss >> type_or_zero;
-			b.type = type_or_zero;
-
-			if (type_or_zero == 0)
+			int t;
+			ss >> t;
+			b.type = t;
+			if (t == 0)
 			{
 				ss >> b.id >> b.p.x >> b.p.y >> b.num_astronauts;
-				for (int k = 0; k < b.num_astronauts; ++k)
-				{
-					int type;
-					ss >> type;
-					b.astronaut_counts[type]++;
-				}
+				int type_req;
+				while (ss >> type_req)
+					b.astronaut_counts[type_req]++;
 			}
 			else
 			{
@@ -550,5 +549,4 @@ int main()
 
 		solver.solve();
 	}
-	return 0;
 }
