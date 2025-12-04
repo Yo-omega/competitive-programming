@@ -92,6 +92,7 @@ public:
 	vector<Route> routes;		  // Refreshed every turn
 	vector<Pod> pods;			  // Refreshed every turn
 	int resources;
+	int next_pod_id = 1;
 
 	// Helpers for logic
 	map<pair<int, int>, int> route_capacity_map; // {b1,b2} -> capacity
@@ -418,7 +419,7 @@ public:
 				resources -= tube_cost;
 
 				// Build pod with ping-pong schedule
-				int pod_id = pods.size() + 100 + rand() % 1000;
+				int pod_id = next_pod_id++;
 				action_queue.push_back("POD " + to_string(pod_id) + " " + to_string(from) + " " + to_string(to) + " " + to_string(from));
 				resources -= pod_cost;
 
